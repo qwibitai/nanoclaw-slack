@@ -37,7 +37,7 @@ git fetch nanoclaw-whatsapp
 git checkout -B whatsapp-merge nanoclaw-whatsapp/main
 git merge main
 # Resolve conflicts (see below)
-# Remove upstream-only workflows if they were re-added by the merge:
+# Remove upstream-only workflows (re-added by every merge since main has them):
 git rm .github/workflows/bump-version.yml .github/workflows/update-tokens.yml 2>/dev/null
 git push nanoclaw-whatsapp HEAD:main
 git checkout main && git branch -D whatsapp-merge
@@ -61,7 +61,7 @@ The same files conflict every time:
 | `.env.example` | Combine: main's entries + fork/branch-specific entries |
 | `repo-tokens/badge.svg` | Take main's version (auto-generated) |
 
-Source code changes (e.g. `src/types.ts`, `src/index.ts`) usually auto-merge cleanly, but can conflict if both sides modify the same lines. Build and test after every forward merge.
+Source code changes (e.g. `src/types.ts`, `src/index.ts`) usually auto-merge cleanly, but can conflict if both sides modify the same lines. **Always build and test after every forward merge** — auto-merged code can be silently wrong (e.g. referencing a renamed function or using a removed parameter) even when git reports no conflicts.
 
 ## When to merge forward
 
