@@ -34,7 +34,11 @@ export class SlackChannel implements Channel {
   private app: App;
   private botUserId: string | undefined;
   private connected = false;
-  private outgoingQueue: Array<{ jid: string; text: string }> = [];
+  private outgoingQueue: Array<{
+    jid: string;
+    text: string;
+    sessionContext?: string;
+  }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
 
@@ -79,12 +83,10 @@ export class SlackChannel implements Channel {
 
       if (!msg.text) return;
 
-      // Threaded replies are flattened into the channel conversation.
-      // The agent sees them alongside channel-level messages; responses
-      // always go to the channel, not back into the thread.
-
       const jid = `slack:${msg.channel}`;
-      const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
+      const msgTs = msg.ts;
+      const msgThreadTs = (msg as { thread_ts?: string }).thread_ts;
+      const timestamp = new Date(parseFloat(msgTs) * 1000).toISOString();
       const isGroup = msg.channel_type !== 'im';
 
       // Always report metadata for group discovery
@@ -94,8 +96,8 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      const group = groups[jid];
+      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
       let senderName: string;
       if (isBotMessage) {
@@ -118,8 +120,16 @@ export class SlackChannel implements Channel {
         }
       }
 
+      // When the group has isolatedSessions enabled, supply a sessionContext so
+      // the core isolates each thread's Claude session. Thread replies use the
+      // root thread_ts as the context key; root messages use their own ts.
+      // Without isolatedSessions all messages share the group's single session.
+      const sessionContext = group.isolatedSessions
+        ? (msgThreadTs ?? msgTs)
+        : undefined;
+
       this.opts.onMessage(jid, {
-        id: msg.ts,
+        id: msgTs,
         chat_jid: jid,
         sender: msg.user || msg.bot_id || '',
         sender_name: senderName,
@@ -127,6 +137,7 @@ export class SlackChannel implements Channel {
         timestamp,
         is_from_me: isBotMessage,
         is_bot_message: isBotMessage,
+        sessionContext,
       });
     });
   }
@@ -157,11 +168,15 @@ export class SlackChannel implements Channel {
     await this.syncChannelMetadata();
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(
+    jid: string,
+    text: string,
+    sessionContext?: string,
+  ): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
 
     if (!this.connected) {
-      this.outgoingQueue.push({ jid, text });
+      this.outgoingQueue.push({ jid, text, sessionContext });
       logger.info(
         { jid, queueSize: this.outgoingQueue.length },
         'Slack disconnected, message queued',
@@ -171,19 +186,25 @@ export class SlackChannel implements Channel {
 
     try {
       // Slack limits messages to ~4000 characters; split if needed
+      const threadOpts = sessionContext ? { thread_ts: sessionContext } : {};
       if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          text,
+          ...threadOpts,
+        });
       } else {
         for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
           await this.app.client.chat.postMessage({
             channel: channelId,
             text: text.slice(i, i + MAX_MESSAGE_LENGTH),
+            ...threadOpts,
           });
         }
       }
       logger.info({ jid, length: text.length }, 'Slack message sent');
     } catch (err) {
-      this.outgoingQueue.push({ jid, text });
+      this.outgoingQueue.push({ jid, text, sessionContext });
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack message, queued',
@@ -275,9 +296,13 @@ export class SlackChannel implements Channel {
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
         const channelId = item.jid.replace(/^slack:/, '');
+        const threadOpts = item.sessionContext
+          ? { thread_ts: item.sessionContext }
+          : {};
         await this.app.client.chat.postMessage({
           channel: channelId,
           text: item.text,
+          ...threadOpts,
         });
         logger.info(
           { jid: item.jid, length: item.text.length },

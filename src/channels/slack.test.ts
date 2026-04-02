@@ -106,6 +106,23 @@ function createTestOpts(
   };
 }
 
+function createIsolatedTestOpts(
+  overrides?: Partial<SlackChannelOpts>,
+): SlackChannelOpts {
+  return createTestOpts({
+    registeredGroups: vi.fn(() => ({
+      'slack:C0123456789': {
+        name: 'Test Channel',
+        folder: 'test-channel',
+        trigger: '@Jonesy',
+        added_at: '2024-01-01T00:00:00.000Z',
+        isolatedSessions: true,
+      },
+    })),
+    ...overrides,
+  });
+}
+
 function createMessageEvent(overrides: {
   channel?: string;
   channelType?: string;
@@ -679,6 +696,167 @@ describe('SlackChannel', () => {
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
         channel: 'C0123456789',
         text: 'Second queued',
+      });
+    });
+  });
+
+  // --- isolatedSessions threading ---
+
+  describe('isolatedSessions threading', () => {
+    it('sets sessionContext to ts for root messages when isolatedSessions is true', async () => {
+      const opts = createIsolatedTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: 'Root message',
+      }));
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          sessionContext: '1704067200.000000',
+        }),
+      );
+    });
+
+    it('sets sessionContext to thread_ts for thread replies when isolatedSessions is true', async () => {
+      const opts = createIsolatedTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067201.000000',
+        threadTs: '1704067200.000000',
+        text: 'Thread reply',
+      }));
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          sessionContext: '1704067200.000000',
+        }),
+      );
+    });
+
+    it('does not set sessionContext when isolatedSessions is not set', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: 'Normal message',
+      }));
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          sessionContext: undefined,
+        }),
+      );
+    });
+
+    it('root and thread reply from same thread share sessionContext', async () => {
+      const opts = createIsolatedTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Root message
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067200.000000',
+        text: 'Root',
+      }));
+
+      // Reply in that thread
+      await triggerMessageEvent(createMessageEvent({
+        ts: '1704067201.000000',
+        threadTs: '1704067200.000000',
+        text: 'Reply',
+      }));
+
+      const calls = vi.mocked(opts.onMessage).mock.calls;
+      expect(calls[0][1].sessionContext).toBe('1704067200.000000');
+      expect(calls[1][1].sessionContext).toBe('1704067200.000000');
+    });
+
+    it('two different threads get different sessionContext values', async () => {
+      const opts = createIsolatedTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerMessageEvent(createMessageEvent({ ts: '1704067200.000000', text: 'A' }));
+      await triggerMessageEvent(createMessageEvent({ ts: '1704067300.000000', text: 'B' }));
+
+      const calls = vi.mocked(opts.onMessage).mock.calls;
+      expect(calls[0][1].sessionContext).toBe('1704067200.000000');
+      expect(calls[1][1].sessionContext).toBe('1704067300.000000');
+    });
+
+    it('sendMessage with sessionContext posts to thread', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('slack:C0123456789', 'Reply', '1704067200.000000');
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Reply',
+        thread_ts: '1704067200.000000',
+      });
+    });
+
+    it('sendMessage without sessionContext posts to channel', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('slack:C0123456789', 'Channel message');
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Channel message',
+      });
+    });
+
+    it('splits long threaded messages with thread_ts on every chunk', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const longText = 'X'.repeat(4500);
+      await channel.sendMessage('slack:C0123456789', longText, '1704067200.000000');
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledTimes(2);
+      expect(currentApp().client.chat.postMessage).toHaveBeenNthCalledWith(1, {
+        channel: 'C0123456789',
+        text: 'X'.repeat(4000),
+        thread_ts: '1704067200.000000',
+      });
+      expect(currentApp().client.chat.postMessage).toHaveBeenNthCalledWith(2, {
+        channel: 'C0123456789',
+        text: 'X'.repeat(500),
+        thread_ts: '1704067200.000000',
+      });
+    });
+
+    it('flushes queued threaded messages with thread_ts on reconnect', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+
+      // Queue while disconnected
+      await channel.sendMessage('slack:C0123456789', 'Queued reply', '1704067200.000000');
+
+      expect(currentApp().client.chat.postMessage).not.toHaveBeenCalled();
+
+      await channel.connect();
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        text: 'Queued reply',
+        thread_ts: '1704067200.000000',
       });
     });
   });
