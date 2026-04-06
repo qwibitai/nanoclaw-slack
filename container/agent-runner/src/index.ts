@@ -501,6 +501,30 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+
+      // Stream every assistant text block to the host as it arrives.
+      // The SDK's `result` message only carries the *final* assistant text
+      // after end_turn. When the agent iterates within one query
+      // (answer -> tool_use -> tool_result -> reflection), earlier text
+      // blocks would be lost — and if the final block is wrapped in
+      // <internal>...</internal>, the host strips it and sends nothing,
+      // losing the user-facing answer entirely. Emitting per-assistant
+      // ensures every text block is dispatched.
+      const assistantMsg = message as {
+        message?: { content?: Array<{ type: string; text?: string }> };
+      };
+      const assistantText = (assistantMsg.message?.content ?? [])
+        .filter((c) => c.type === 'text' && typeof c.text === 'string')
+        .map((c) => c.text as string)
+        .join('');
+      if (assistantText.trim()) {
+        log(`Streaming assistant text (${assistantText.length} chars)`);
+        writeOutput({
+          status: 'success',
+          result: assistantText,
+          newSessionId,
+        });
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -529,9 +553,12 @@ async function runQuery(
       log(
         `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
       );
+      // Text was already streamed via the assistant branch above.
+      // Emit a session-update marker only (result: null) to avoid
+      // double-sending the final block to the user.
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: null,
         newSessionId,
       });
     }
