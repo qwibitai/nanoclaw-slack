@@ -32,8 +32,8 @@ type Handler = (...args: any[]) => any;
 
 const appRef = vi.hoisted(() => ({ current: null as any }));
 
-vi.mock('@slack/bolt', () => ({
-  App: class MockApp {
+vi.mock('@slack/bolt', () => {
+  const MockApp = class MockApp {
     eventHandlers = new Map<string, Handler>();
     token: string;
     appToken: string;
@@ -70,9 +70,14 @@ vi.mock('@slack/bolt', () => ({
 
     async start() {}
     async stop() {}
-  },
-  LogLevel: { ERROR: 'error' },
-}));
+  };
+  const exports = {
+    App: MockApp,
+    LogLevel: { ERROR: 'error' },
+    HTTPReceiver: class MockHTTPReceiver {},
+  };
+  return { ...exports, default: exports };
+});
 
 // Mock env
 vi.mock('../env.js', () => ({
@@ -788,18 +793,19 @@ describe('SlackChannel', () => {
       });
 
       expect(() => new SlackChannel(createTestOpts())).toThrow(
-        'SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in .env',
+        'SLACK_BOT_TOKEN must be set in .env',
       );
     });
 
-    it('throws when SLACK_APP_TOKEN is missing', () => {
+    it('throws when neither SLACK_APP_TOKEN nor SLACK_SIGNING_SECRET is set', () => {
       vi.mocked(readEnvFile).mockReturnValueOnce({
         SLACK_BOT_TOKEN: 'xoxb-test-token',
         SLACK_APP_TOKEN: '',
+        SLACK_SIGNING_SECRET: '',
       });
 
       expect(() => new SlackChannel(createTestOpts())).toThrow(
-        'SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in .env',
+        'Either SLACK_APP_TOKEN (Socket Mode) or SLACK_SIGNING_SECRET (HTTP webhooks) must be set in .env',
       );
     });
   });
