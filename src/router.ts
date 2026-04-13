@@ -1,3 +1,5 @@
+import path from 'path';
+
 import { Channel, NewMessage } from './types.js';
 import { formatLocalTime } from './timezone.js';
 
@@ -23,7 +25,15 @@ export function formatMessages(
       m.reply_to_message_content && m.reply_to_sender_name
         ? `\n  <quoted_message from="${escapeXml(m.reply_to_sender_name)}">${escapeXml(m.reply_to_message_content)}</quoted_message>`
         : '';
-    return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}"${replyAttr}>${replySnippet}${escapeXml(m.content)}</message>`;
+    let body = escapeXml(m.content);
+    if (m.attachments && m.attachments.length > 0) {
+      const attachLines = m.attachments.map(
+        (a) =>
+          `<attachment filename="${escapeXml(a.filename)}" mimetype="${escapeXml(a.mimetype)}" path="/workspace/attachments/${escapeXml(path.basename(a.hostPath))}" />`,
+      );
+      body += '\n' + attachLines.join('\n');
+    }
+    return `<message sender="${escapeXml(m.sender_name)}" time="${escapeXml(displayTime)}"${replyAttr}>${replySnippet}${body}</message>`;
   });
 
   const header = `<context timezone="${escapeXml(timezone)}" />\n`;

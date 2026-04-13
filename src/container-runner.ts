@@ -165,6 +165,16 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Per-group attachments directory (images downloaded from channels)
+  const attachDir = path.join(DATA_DIR, 'attachments', group.folder);
+  if (fs.existsSync(attachDir)) {
+    mounts.push({
+      hostPath: attachDir,
+      containerPath: '/workspace/attachments',
+      readonly: true,
+    });
+  }
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);

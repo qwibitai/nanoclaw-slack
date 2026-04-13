@@ -42,6 +42,13 @@ export interface RegisteredGroup {
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
 }
 
+export interface MessageAttachment {
+  filename: string;
+  mimetype: string;
+  /** Absolute path on the host filesystem */
+  hostPath: string;
+}
+
 export interface NewMessage {
   id: string;
   chat_jid: string;
@@ -55,6 +62,7 @@ export interface NewMessage {
   reply_to_message_id?: string;
   reply_to_message_content?: string;
   reply_to_sender_name?: string;
+  attachments?: MessageAttachment[];
 }
 
 export interface ScheduledTask {
