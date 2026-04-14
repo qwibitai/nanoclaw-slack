@@ -2,7 +2,12 @@ import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
-import { updateChatName } from '../db.js';
+import {
+  getLatestMessage,
+  removeReaction,
+  storeReaction,
+  updateChatName,
+} from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -129,6 +134,68 @@ export class SlackChannel implements Channel {
         is_bot_message: isBotMessage,
       });
     });
+
+    this.app.event('reaction_added', async ({ event }) => {
+      await this.handleReactionEvent(event, 'added');
+    });
+
+    this.app.event('reaction_removed', async ({ event }) => {
+      await this.handleReactionEvent(event, 'removed');
+    });
+  }
+
+  private async handleReactionEvent(
+    event: {
+      user?: string;
+      reaction?: string;
+      item?: { type?: string; channel?: string; ts?: string };
+      event_ts?: string;
+    },
+    kind: 'added' | 'removed',
+  ): Promise<void> {
+    try {
+      if (!event.item || event.item.type !== 'message') return;
+      const channelId = event.item.channel;
+      const messageId = event.item.ts;
+      const emoji = event.reaction;
+      const reactorUserId = event.user;
+      if (!channelId || !messageId || !emoji || !reactorUserId) return;
+
+      const chatJid = `slack:${channelId}`;
+      const groups = this.opts.registeredGroups();
+      if (!groups[chatJid]) return;
+
+      const timestamp = event.event_ts
+        ? new Date(parseFloat(event.event_ts) * 1000).toISOString()
+        : new Date().toISOString();
+      const reactorJid = `slack:${reactorUserId}`;
+      const reactorName = await this.resolveUserName(reactorUserId);
+
+      if (kind === 'added') {
+        storeReaction({
+          message_id: messageId,
+          message_chat_jid: chatJid,
+          reactor_jid: reactorJid,
+          reactor_name: reactorName,
+          emoji,
+          timestamp,
+        });
+      } else {
+        removeReaction(messageId, chatJid, reactorJid, emoji);
+      }
+
+      logger.info(
+        {
+          chatJid,
+          messageId,
+          reactor: reactorName || reactorUserId,
+          emoji,
+        },
+        kind === 'added' ? 'Slack reaction added' : 'Slack reaction removed',
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to process Slack reaction');
+    }
   }
 
   async connect(): Promise<void> {
@@ -189,6 +256,88 @@ export class SlackChannel implements Channel {
         'Failed to send Slack message, queued',
       );
     }
+  }
+
+  /**
+   * Send a reaction to a message.
+   * `emoji` is the Slack shortcode name without surrounding colons
+   * (e.g. `"thumbsup"`, `"+1"`). An empty or falsy value removes the bot's
+   * reaction — Slack requires the original emoji name to remove, which we
+   * can't reconstruct without state, so callers should pass the emoji that
+   * was previously added.
+   */
+  async sendReaction(
+    chatJid: string,
+    messageKey: { id: string; remoteJid: string },
+    emoji: string,
+  ): Promise<void> {
+    if (!this.connected) {
+      logger.warn({ chatJid, emoji }, 'Cannot send reaction - not connected');
+      throw new Error('Not connected to Slack');
+    }
+
+    const channelId = (messageKey.remoteJid || chatJid).replace(/^slack:/, '');
+    const name = this.normalizeEmojiName(emoji);
+
+    try {
+      if (!name) {
+        // Empty emoji is treated as "remove whatever I reacted with" — but
+        // Slack has no "remove all" API, so we no-op and log.
+        logger.warn(
+          { chatJid },
+          'sendReaction called with empty emoji — Slack requires a specific emoji name to remove; no-op',
+        );
+        return;
+      }
+      await this.app.client.reactions.add({
+        channel: channelId,
+        timestamp: messageKey.id,
+        name,
+      });
+      logger.info(
+        { chatJid, messageId: messageKey.id, emoji: name },
+        'Slack reaction sent',
+      );
+    } catch (err) {
+      const errMsg = (err as { data?: { error?: string } })?.data?.error;
+      if (errMsg === 'already_reacted') {
+        logger.debug(
+          { chatJid, emoji: name },
+          'Slack reaction already present, ignoring',
+        );
+        return;
+      }
+      logger.error({ chatJid, emoji: name, err }, 'Failed to send Slack reaction');
+      throw err;
+    }
+  }
+
+  async reactToLatestMessage(chatJid: string, emoji: string): Promise<void> {
+    const latest = getLatestMessage(chatJid);
+    if (!latest) {
+      throw new Error(`No messages found for chat ${chatJid}`);
+    }
+    await this.sendReaction(
+      chatJid,
+      { id: latest.id, remoteJid: chatJid },
+      emoji,
+    );
+  }
+
+  /**
+   * Normalize an emoji input to the Slack shortcode name used by the
+   * reactions API. Accepts:
+   *   - bare shortcode   → `thumbsup`
+   *   - wrapped shortcode → `:thumbsup:`
+   *   - unicode emoji    → currently unsupported, returned as-is
+   */
+  private normalizeEmojiName(emoji: string): string {
+    if (!emoji) return '';
+    const trimmed = emoji.trim();
+    if (trimmed.startsWith(':') && trimmed.endsWith(':')) {
+      return trimmed.slice(1, -1);
+    }
+    return trimmed;
   }
 
   isConnected(): boolean {
