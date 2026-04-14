@@ -82,6 +82,20 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS reactions (
+      message_id TEXT NOT NULL,
+      message_chat_jid TEXT NOT NULL,
+      reactor_jid TEXT NOT NULL,
+      reactor_name TEXT,
+      emoji TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      PRIMARY KEY (message_id, message_chat_jid, reactor_jid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id, message_chat_jid);
+    CREATE INDEX IF NOT EXISTS idx_reactions_reactor ON reactions(reactor_jid);
+    CREATE INDEX IF NOT EXISTS idx_reactions_emoji ON reactions(emoji);
+    CREATE INDEX IF NOT EXISTS idx_reactions_timestamp ON reactions(timestamp);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -281,6 +295,71 @@ export function setLastGroupSync(): void {
   db.prepare(
     `INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES ('__group_sync__', '__group_sync__', ?)`,
   ).run(now);
+}
+
+export interface Reaction {
+  message_id: string;
+  message_chat_jid: string;
+  reactor_jid: string;
+  reactor_name?: string;
+  emoji: string;
+  timestamp: string;
+}
+
+/**
+ * Store or remove a reaction. Passing an empty emoji removes any existing
+ * reaction from `reactor_jid` on the target message.
+ */
+export function storeReaction(reaction: Reaction): void {
+  if (!reaction.emoji) {
+    db.prepare(
+      `DELETE FROM reactions WHERE message_id = ? AND message_chat_jid = ? AND reactor_jid = ?`,
+    ).run(
+      reaction.message_id,
+      reaction.message_chat_jid,
+      reaction.reactor_jid,
+    );
+    return;
+  }
+  db.prepare(
+    `INSERT OR REPLACE INTO reactions (message_id, message_chat_jid, reactor_jid, reactor_name, emoji, timestamp)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    reaction.message_id,
+    reaction.message_chat_jid,
+    reaction.reactor_jid,
+    reaction.reactor_name || null,
+    reaction.emoji,
+    reaction.timestamp,
+  );
+}
+
+/**
+ * Remove a specific (reactor_jid, emoji) reaction. Used by channels like Slack
+ * that deliver explicit reaction_removed events per emoji.
+ */
+export function removeReaction(
+  messageId: string,
+  chatJid: string,
+  reactorJid: string,
+  emoji: string,
+): void {
+  db.prepare(
+    `DELETE FROM reactions
+     WHERE message_id = ? AND message_chat_jid = ? AND reactor_jid = ? AND emoji = ?`,
+  ).run(messageId, chatJid, reactorJid, emoji);
+}
+
+export function getLatestMessage(
+  chatJid: string,
+): { id: string; fromMe: boolean } | undefined {
+  const row = db
+    .prepare(
+      `SELECT id, is_from_me FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1`,
+    )
+    .get(chatJid) as { id: string; is_from_me: number | null } | undefined;
+  if (!row) return undefined;
+  return { id: row.id, fromMe: row.is_from_me === 1 };
 }
 
 /**

@@ -24,6 +24,9 @@ vi.mock('../logger.js', () => ({
 // Mock db
 vi.mock('../db.js', () => ({
   updateChatName: vi.fn(),
+  storeReaction: vi.fn(),
+  removeReaction: vi.fn(),
+  getLatestMessage: vi.fn(() => ({ id: '1704067200.000000', fromMe: false })),
 }));
 
 // --- @slack/bolt mock ---
@@ -56,6 +59,10 @@ vi.mock('@slack/bolt', () => ({
           user: { real_name: 'Alice Smith', name: 'alice' },
         }),
       },
+      reactions: {
+        add: vi.fn().mockResolvedValue({ ok: true }),
+        remove: vi.fn().mockResolvedValue({ ok: true }),
+      },
     };
 
     constructor(opts: any) {
@@ -83,7 +90,12 @@ vi.mock('../env.js', () => ({
 }));
 
 import { SlackChannel, SlackChannelOpts } from './slack.js';
-import { updateChatName } from '../db.js';
+import {
+  updateChatName,
+  storeReaction,
+  removeReaction,
+  getLatestMessage,
+} from '../db.js';
 import { readEnvFile } from '../env.js';
 
 // --- Test helpers ---
@@ -134,6 +146,34 @@ function currentApp() {
 
 async function triggerMessageEvent(event: ReturnType<typeof createMessageEvent>) {
   const handler = currentApp().eventHandlers.get('message');
+  if (handler) await handler({ event });
+}
+
+function createReactionEvent(overrides: {
+  user?: string;
+  reaction?: string;
+  channel?: string;
+  ts?: string;
+  eventTs?: string;
+  itemType?: string;
+}) {
+  return {
+    user: overrides.user ?? 'U_USER_456',
+    reaction: overrides.reaction ?? 'thumbsup',
+    item: {
+      type: overrides.itemType ?? 'message',
+      channel: overrides.channel ?? 'C0123456789',
+      ts: overrides.ts ?? '1704067200.000000',
+    },
+    event_ts: overrides.eventTs ?? '1704067260.000000',
+  };
+}
+
+async function triggerReactionEvent(
+  kind: 'reaction_added' | 'reaction_removed',
+  event: ReturnType<typeof createReactionEvent>,
+) {
+  const handler = currentApp().eventHandlers.get(kind);
   if (handler) await handler({ event });
 }
 
@@ -837,6 +877,190 @@ describe('SlackChannel', () => {
       // Both channels from both pages stored
       expect(updateChatName).toHaveBeenCalledWith('slack:C001', 'general');
       expect(updateChatName).toHaveBeenCalledWith('slack:C002', 'random');
+    });
+  });
+
+  // --- Reactions ---
+
+  describe('reactions', () => {
+    it('registers reaction_added and reaction_removed handlers', () => {
+      new SlackChannel(createTestOpts());
+      expect(currentApp().eventHandlers.has('reaction_added')).toBe(true);
+      expect(currentApp().eventHandlers.has('reaction_removed')).toBe(true);
+    });
+
+    it('stores inbound reaction_added for registered channels', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerReactionEvent(
+        'reaction_added',
+        createReactionEvent({ reaction: 'thumbsup', user: 'U_USER_456' }),
+      );
+
+      expect(storeReaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message_id: '1704067200.000000',
+          message_chat_jid: 'slack:C0123456789',
+          reactor_jid: 'slack:U_USER_456',
+          emoji: 'thumbsup',
+        }),
+      );
+    });
+
+    it('ignores reactions for unregistered channels', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerReactionEvent(
+        'reaction_added',
+        createReactionEvent({ channel: 'C_UNREGISTERED' }),
+      );
+
+      expect(storeReaction).not.toHaveBeenCalled();
+    });
+
+    it('ignores reaction events on non-message items', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerReactionEvent(
+        'reaction_added',
+        createReactionEvent({ itemType: 'file' }),
+      );
+
+      expect(storeReaction).not.toHaveBeenCalled();
+    });
+
+    it('removes reaction on reaction_removed event', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await triggerReactionEvent(
+        'reaction_removed',
+        createReactionEvent({ reaction: 'thumbsup', user: 'U_USER_456' }),
+      );
+
+      expect(removeReaction).toHaveBeenCalledWith(
+        '1704067200.000000',
+        'slack:C0123456789',
+        'slack:U_USER_456',
+        'thumbsup',
+      );
+      expect(storeReaction).not.toHaveBeenCalled();
+    });
+
+    it('sendReaction calls reactions.add with channel + ts', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendReaction(
+        'slack:C0123456789',
+        { id: '1704067200.000000', remoteJid: 'slack:C0123456789' },
+        'thumbsup',
+      );
+
+      expect(currentApp().client.reactions.add).toHaveBeenCalledWith({
+        channel: 'C0123456789',
+        timestamp: '1704067200.000000',
+        name: 'thumbsup',
+      });
+    });
+
+    it('sendReaction strips surrounding colons from shortcodes', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.sendReaction(
+        'slack:C0123456789',
+        { id: '1704067200.000000', remoteJid: 'slack:C0123456789' },
+        ':tada:',
+      );
+
+      expect(currentApp().client.reactions.add).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'tada' }),
+      );
+    });
+
+    it('sendReaction swallows already_reacted errors', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.reactions.add.mockRejectedValueOnce({
+        data: { error: 'already_reacted' },
+      });
+
+      await expect(
+        channel.sendReaction(
+          'slack:C0123456789',
+          { id: '1704067200.000000', remoteJid: 'slack:C0123456789' },
+          'thumbsup',
+        ),
+      ).resolves.toBeUndefined();
+    });
+
+    it('sendReaction propagates unexpected errors', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      currentApp().client.reactions.add.mockRejectedValueOnce({
+        data: { error: 'channel_not_found' },
+      });
+
+      await expect(
+        channel.sendReaction(
+          'slack:C0123456789',
+          { id: '1704067200.000000', remoteJid: 'slack:C0123456789' },
+          'thumbsup',
+        ),
+      ).rejects.toBeDefined();
+    });
+
+    it('sendReaction throws when disconnected', async () => {
+      const channel = new SlackChannel(createTestOpts());
+      // not calling connect()
+      await expect(
+        channel.sendReaction(
+          'slack:C0123456789',
+          { id: '1704067200.000000', remoteJid: 'slack:C0123456789' },
+          'thumbsup',
+        ),
+      ).rejects.toThrow('Not connected to Slack');
+    });
+
+    it('reactToLatestMessage looks up latest then reacts', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      await channel.reactToLatestMessage('slack:C0123456789', 'eyes');
+
+      expect(getLatestMessage).toHaveBeenCalledWith('slack:C0123456789');
+      expect(currentApp().client.reactions.add).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel: 'C0123456789',
+          timestamp: '1704067200.000000',
+          name: 'eyes',
+        }),
+      );
+    });
+
+    it('reactToLatestMessage throws when no messages exist', async () => {
+      (getLatestMessage as any).mockReturnValueOnce(undefined);
+      const channel = new SlackChannel(createTestOpts());
+      await channel.connect();
+
+      await expect(
+        channel.reactToLatestMessage('slack:C0123456789', 'eyes'),
+      ).rejects.toThrow('No messages found');
     });
   });
 
